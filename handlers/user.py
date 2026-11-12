@@ -1,11 +1,18 @@
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from config import CHANNEL_ID, CHANNEL_URL
+
+from config import CHANNEL_ID, CHANNEL_URL, ADMIN_IDS
 from database.db import add_user, items, item
 from keyboards.user import menu, choices, subscribe
+from keyboards.admin import menu as admin_menu
 from services.campaigns import insert_ad
 
 router = Router()
@@ -18,7 +25,9 @@ class U(StatesGroup):
 WELCOME = (
     "Hey, girl! 💋\n"
     "Welcome to Slay English!\n"
-    "Я собрала для тебя свои полезные материалы, бесплатные подарки и кое-что интересное для тех, кто хочет прокачать свой English ещё сильнее\n"
+    "Я собрала для тебя свои полезные материалы, бесплатные подарки "
+    "и кое-что интересное для тех, кто хочет прокачать свой English "
+    "ещё сильнее\n"
     "выбирай, с чего начнём 👇🏻"
 )
 
@@ -54,7 +63,8 @@ async def deliver_item(message, it, kind, bot):
         if typ in methods:
             await methods[typ](
                 fid,
-                caption=it["title"] if typ not in ("voice", "video_note") else None
+                caption=it["title"]
+                if typ not in ("voice", "video_note") else None
             )
         else:
             await message.answer_document(fid, caption=it["title"])
@@ -64,7 +74,10 @@ async def deliver_item(message, it, kind, bot):
             it["title"],
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[
-                    InlineKeyboardButton(text="Открыть", url=it["url"])
+                    InlineKeyboardButton(
+                        text="Открыть",
+                        url=it["url"]
+                    )
                 ]]
             )
         )
@@ -75,16 +88,27 @@ async def deliver_item(message, it, kind, bot):
 
 @router.message(F.text == "/start")
 async def start(m: Message, state: FSMContext):
-    from config import ADMIN_IDS
-    from keyboards.admin import menu as admin_menu
-
     await state.clear()
     await add_user(m.from_user)
 
-    if m.from_user.id in ADMIN_IDS:
-        await m.answer(WELCOME, reply_markup=admin_menu())
-    else:
-        await m.answer(WELCOME, reply_markup=menu())
+    is_admin = m.from_user.id in ADMIN_IDS
+
+    await m.answer(
+        WELCOME,
+        reply_markup=menu(is_admin=is_admin)
+    )
+
+
+@router.message(F.text == "⚙️ Админ-панель")
+async def open_admin_panel(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+
+    await state.clear()
+    await m.answer(
+        "⚙️ Админ-панель",
+        reply_markup=admin_menu()
+    )
 
 
 @router.message(F.text == "✨ Забрать бесплатные материалы")
@@ -114,7 +138,10 @@ async def get(call: CallbackQuery, bot, state: FSMContext):
 
     if kind == "material" and not await is_sub(bot, call.from_user.id):
         await state.set_state(U.waiting)
-        await state.update_data(pending_item=int(i), pending_kind=kind)
+        await state.update_data(
+            pending_item=int(i),
+            pending_kind=kind
+        )
 
         await call.message.answer(
             "Подпишись на канал, чтобы получить выбранный материал 🩷",
@@ -145,9 +172,14 @@ async def subcheck(c: CallbackQuery, bot, state: FSMContext):
         else:
             await c.message.answer(
                 "Подписка подтверждена! Теперь выбери материал 🩷",
-                reply_markup=menu()
+                reply_markup=menu(
+                    is_admin=c.from_user.id in ADMIN_IDS
+                )
             )
 
         await state.clear()
     else:
-        await c.answer("Подписку пока не вижу", show_alert=True)
+        await c.answer(
+            "Подписку пока не вижу",
+            show_alert=True
+        )

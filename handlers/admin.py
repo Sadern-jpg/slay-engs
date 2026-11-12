@@ -1,248 +1,511 @@
-import json
-from urllib.parse import urlparse
+
+import asyncio
+
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from database.db import add_item, get_items, toggle_item, delete_item, create_campaign, get_stats
-from keyboards.admin import menu
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, CallbackQuery
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+
+from config import settings
+from database.db import *
+from keyboards.admin import (
+    admin_menu,
+    list_kb,
+    item_kb,
+    confirm_broadcast,
+)
 
 router = Router()
 
-class AdminStates(StatesGroup):
-    title = State(); descr = State(); content = State(); url = State()
-    campaign_content = State(); campaign_buttons = State(); campaign_interval = State(); campaign_duration = State()
 
-def is_admin(user_id, cfg):
-    return user_id in cfg.ADMIN_IDS
+def is_admin(uid):
+    return uid in settings.ADMIN_IDS
 
-def valid_url(value):
-    p = urlparse(value)
-    return p.scheme in ("http", "https") and bool(p.netloc)
 
-PAGE_SIZE = 8
+async def no_access(c):
+    await c.answer("Нет доступа", show_alert=True)
 
-def item_keyboard(rows, kind, page=0):
-    start = page * PAGE_SIZE
-    page_rows = rows[start:start + PAGE_SIZE]
-    buttons = []
-    for row in page_rows:
-        buttons.append([
-            InlineKeyboardButton(text=("🟢 " if row["active"] else "⚪ ") + row["title"][:35], callback_data=f"itemtoggle:{row['id']}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"itemdelete:{row['id']}"),
-        ])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"itempage:{kind}:{page-1}"))
-    if start + PAGE_SIZE < len(rows):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"itempage:{kind}:{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data="itemadd")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-@router.message(F.text == "/cancel")
-async def cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.", reply_markup=menu())
-
-@router.message(F.text == "/admin")
-async def admin_panel(message: Message, state: FSMContext, cfg):
-    if is_admin(message.from_user.id, cfg):
-        await state.clear(); await message.answer("⚙️ Админ-панель", reply_markup=menu())
-
-@router.message(F.text.in_({"📚 Материалы", "💎 Управление курсами"}))
-async def manage_items(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    kind = "material" if message.text == "📚 Материалы" else "course"
-    await state.update_data(item_kind=kind)
-    rows = await get_items(kind)
-    await message.answer("Управление записями. 🟢/⚪ — активность, 🗑 — удалить:", reply_markup=item_keyboard(rows, kind))
-
-@router.callback_query(F.data.startswith("itemtoggle:"))
-async def item_toggle(call: CallbackQuery, state: FSMContext, cfg):
-    if not is_admin(call.from_user.id, cfg):
-        await call.answer("Нет доступа", show_alert=True); return
-    await toggle_item(int(call.data.split(":", 1)[1]))
-    data = await state.get_data(); kind = data.get("item_kind", "material")
-    rows = await get_items(kind)
+# Безопасное редактирование сообщений.
+# Если текст и кнопки не изменились, Telegram не будет выдавать ошибку.
+async def safe_edit_text(message, text, reply_markup=None):
     try:
-        await call.message.edit_reply_markup(reply_markup=item_keyboard(rows, kind))
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc): raise
-    await call.answer("Статус изменён")
+        await message.edit_text(
+            text,
+            reply_markup=reply_markup
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
-@router.callback_query(F.data.startswith("itempage:"))
-async def item_page(call: CallbackQuery, cfg):
-    if not is_admin(call.from_user.id, cfg):
-        await call.answer("Нет доступа", show_alert=True)
+class Material(StatesGroup):
+    title = State()
+    description = State()
+    payload = State()
+
+
+class Offer(StatesGroup):
+    title = State()
+    description = State()
+    url = State()
+
+
+class Broadcast(StatesGroup):
+    content = State()
+
+
+# =========================
+# АДМИН-ПАНЕЛЬ
+# =========================
+
+@router.message(Command("admin"))
+async def admin_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        await m.answer("Нет доступа")
         return
-    try:
-        _, kind, page_raw = call.data.split(":", 2)
-        page = max(0, int(page_raw))
-    except ValueError:
-        await call.answer("Некорректная страница", show_alert=True)
+
+    await m.answer(
+        "⚙️ <b>Админ-панель</b>",
+        reply_markup=admin_menu()
+    )
+
+
+@router.callback_query(F.data == "admin")
+async def admin(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
         return
-    if kind not in ("material", "course"):
-        await call.answer("Неизвестный раздел", show_alert=True)
+
+    await safe_edit_text(
+        c.message,
+        "⚙️ <b>Админ-панель</b>",
+        reply_markup=admin_menu()
+    )
+    await c.answer()
+
+
+# =========================
+# ДОБАВЛЕНИЕ МАТЕРИАЛОВ
+# =========================
+
+@router.callback_query(F.data.in_({"add_pdf", "add_link"}))
+async def material_begin(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
         return
-    rows = await get_items(kind)
-    await call.message.edit_reply_markup(reply_markup=item_keyboard(rows, kind, page))
-    await call.answer()
+
+    await state.update_data(
+        kind="pdf" if c.data == "add_pdf" else "link"
+    )
+    await state.set_state(Material.title)
+
+    await c.message.answer("Напиши название материала:")
+    await c.answer()
 
 
-@router.callback_query(F.data.startswith("itemdelete:"))
-async def item_delete(call: CallbackQuery, cfg, state: FSMContext):
-    if not is_admin(call.from_user.id, cfg):
-        await call.answer("Нет доступа", show_alert=True)
+@router.message(Material.title)
+async def material_title(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
         return
-    try:
-        item_id = int(call.data.split(":", 1)[1])
-    except ValueError:
-        await call.answer("Некорректный ID", show_alert=True)
+
+    await state.update_data(title=m.text or "Материал")
+    await state.set_state(Material.description)
+
+    await m.answer(
+        "Описание или точка (.) если без описания:"
+    )
+
+
+@router.message(Material.description)
+async def material_desc(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
         return
-    await delete_item(item_id)
-    data = await state.get_data()
-    kind = data.get("item_kind", "material")
-    rows = await get_items(kind)
-    await call.message.edit_reply_markup(reply_markup=item_keyboard(rows, kind))
-    await call.answer("Запись удалена")
 
-@router.callback_query(F.data == "itemadd")
-async def item_add(call: CallbackQuery, state: FSMContext, cfg):
-    if not is_admin(call.from_user.id, cfg):
-        await call.answer("Нет доступа", show_alert=True); return
-    data = await state.get_data()
-    if data.get("item_kind") not in ("material", "course"):
-        await call.answer("Сначала открой раздел материалов или курсов", show_alert=True); return
-    await state.set_state(AdminStates.title)
-    await call.message.answer("Название:"); await call.answer()
+    description = (
+        ""
+        if (m.text or "").strip() == "."
+        else (m.text or "")
+    )
 
-@router.message(AdminStates.title)
-async def item_title(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    title = (message.text or "").strip()
-    if not title:
-        await message.answer("Название не должно быть пустым. Напиши название:"); return
-    await state.update_data(title=title[:150]); await state.set_state(AdminStates.descr)
-    await message.answer("Описание (или отправь - чтобы пропустить):")
+    await state.update_data(description=description)
 
-@router.message(AdminStates.descr)
-async def item_descr(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    await state.update_data(descr="" if (message.text or "").strip() == "-" else (message.text or message.caption or ""))
-    await state.set_state(AdminStates.content)
-    await message.answer("Пришли файл (документ, фото, видео, аудио, голосовое, GIF, стикер) или напиши «ссылка».")
+    d = await state.get_data()
+    await state.set_state(Material.payload)
 
-@router.message(AdminStates.content)
-async def item_content(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    if (message.text or "").strip().lower() == "ссылка":
-        await state.set_state(AdminStates.url); await message.answer("Пришли ссылку https://..."); return
-    file_id, file_type = None, None
-    for attr, typ in (("document","document"),("photo","photo"),("video","video"),("audio","audio"),("voice","voice"),("animation","animation"),("video_note","video_note"),("sticker","sticker")):
-        value = getattr(message, attr, None)
-        if value:
-            file_id = value[-1].file_id if typ == "photo" else value.file_id
-            file_type = typ; break
-    if not file_id:
-        await message.answer("Не вижу файл. Пришли поддерживаемый файл или напиши «ссылка»."); return
-    data = await state.get_data()
-    await add_item(data["item_kind"], data["title"], data["descr"], file_id, file_type)
-    await state.clear(); await message.answer("Сохранено 🩷", reply_markup=menu())
-
-@router.message(AdminStates.url)
-async def item_url(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    url = (message.text or "").strip()
-    if not valid_url(url):
-        await message.answer("Нужна полная ссылка, начинающаяся с https://"); return
-    data = await state.get_data()
-    await add_item(data["item_kind"], data["title"], data["descr"], url=url)
-    await state.clear(); await message.answer("Ссылка сохранена 🩷", reply_markup=menu())
-
-def parse_links(text):
-    links = []
-    if not text or text.strip() == "-": return "[]"
-    for line in text.splitlines():
-        if "|" not in line: continue
-        label, url = (x.strip() for x in line.split("|", 1))
-        if label and valid_url(url): links.append({"text": label[:60], "url": url})
-    return json.dumps(links, ensure_ascii=False)
-
-def extract_campaign(message):
-    body = message.text or message.caption or ""
-    for attr, typ in (("photo","photo"),("video","video"),("document","document"),("audio","audio"),("animation","animation")):
-        value = getattr(message, attr, None)
-        if value:
-            return typ, value[-1].file_id if typ == "photo" else value.file_id, body
-    if body.strip(): return "text", None, body
-    return None, None, None
-
-@router.message(F.text.in_({"📣 Рассылка", "📢 Реклама", "🧩 Рекламная вставка"}))
-async def start_campaign(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    kind = {"📣 Рассылка":"broadcast", "📢 Реклама":"ad", "🧩 Рекламная вставка":"insert"}[message.text]
-    await state.update_data(campaign_kind=kind); await state.set_state(AdminStates.campaign_content)
-    await message.answer("Пришли текст, фото, видео или документ для сообщения:")
-
-@router.message(AdminStates.campaign_content)
-async def campaign_content(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    ctype, file_id, body = extract_campaign(message)
-    if not ctype:
-        await message.answer("Пришли текст, фото, видео, документ, аудио или GIF."); return
-    await state.update_data(ctype=ctype, file_id=file_id, body=body)
-    await state.set_state(AdminStates.campaign_buttons)
-    await message.answer("Ссылки-кнопки: по одной на строку в формате Название | https://ссылка. Если не нужны — отправь -")
-
-@router.message(AdminStates.campaign_buttons)
-async def campaign_buttons(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    await state.update_data(buttons=parse_links(message.text or "-")); data = await state.get_data(); kind = data["campaign_kind"]
-    if kind == "insert":
-        await create_campaign("insert", data["ctype"], data["body"], data["file_id"], data["buttons"], 24, None)
-        await state.clear(); await message.answer("Рекламная вставка сохранена 🩷", reply_markup=menu()); return
-    await state.set_state(AdminStates.campaign_interval)
-    await message.answer("Интервал в часах: " + ("1, 6, 12 или 24" if kind == "broadcast" else "1, 3, 6 или 12"))
-
-@router.message(AdminStates.campaign_interval)
-async def campaign_interval(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    data = await state.get_data()
-    try: interval = int((message.text or "").strip())
-    except ValueError: interval = 0
-    allowed = (1, 6, 12, 24) if data["campaign_kind"] == "broadcast" else (1, 3, 6, 12)
-    if interval not in allowed:
-        await message.answer("Допустимые варианты: " + ", ".join(map(str, allowed))); return
-    await state.update_data(interval=interval)
-    if data["campaign_kind"] == "broadcast":
-        await state.set_state(AdminStates.campaign_duration); await message.answer("Срок: 1, 6, 12, 24 часа или «навсегда».")
+    if d["kind"] == "pdf":
+        await m.answer("Отправь PDF документом:")
     else:
-        await create_campaign("ad", data["ctype"], data["body"], data["file_id"], data["buttons"], interval, None)
-        await state.clear(); await message.answer("Реклама запущена 🩷", reply_markup=menu())
+        await m.answer("Отправь ссылку https://...")
 
-@router.message(AdminStates.campaign_duration)
-async def campaign_duration(message: Message, state: FSMContext, cfg):
-    if not is_admin(message.from_user.id, cfg): return
-    raw = (message.text or "").strip().lower()
-    duration = None if raw == "навсегда" else int(raw) if raw.isdigit() and int(raw) in (1, 6, 12, 24) else -1
-    if duration == -1:
-        await message.answer("Укажи 1, 6, 12, 24 или «навсегда»."); return
-    data = await state.get_data()
-    await create_campaign("broadcast", data["ctype"], data["body"], data["file_id"], data["buttons"], data["interval"], duration)
-    await state.clear(); await message.answer("Рассылка запущена 🩷", reply_markup=menu())
 
-@router.message(F.text == "📊 Статистика")
-async def statistics(message: Message, cfg):
-    if is_admin(message.from_user.id, cfg):
-        users, materials, courses = await get_stats()
-        await message.answer(f"Пользователей: {users}\nАктивных материалов: {materials}\nАктивных курсов: {courses}")
+@router.message(Material.payload)
+async def material_payload(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
 
-@router.message(F.text == "⬅️ В меню бота")
-async def back_to_user(message: Message, state: FSMContext):
-    from keyboards.user import menu as user_menu
-    await state.clear(); await message.answer("Главное меню", reply_markup=user_menu())
+    d = await state.get_data()
 
+    if d["kind"] == "pdf":
+        if (
+            not m.document
+            or not (m.document.file_name or "").lower().endswith(".pdf")
+        ):
+            await m.answer("Пришли PDF-файл документом.")
+            return
+
+        await add_material(
+            d["title"],
+            d["description"],
+            "pdf",
+            file_id=m.document.file_id
+        )
+
+    else:
+        url = (m.text or "").strip()
+
+        if not url.startswith(("https://", "http://")):
+            await m.answer("Нужна ссылка с https://")
+            return
+
+        await add_material(
+            d["title"],
+            d["description"],
+            "link",
+            url=url
+        )
+
+    await state.clear()
+
+    await m.answer(
+        "Материал добавлен ✨",
+        reply_markup=admin_menu()
+    )
+
+
+# =========================
+# ДОБАВЛЕНИЕ КУРСОВ
+# =========================
+
+@router.callback_query(F.data == "add_offer")
+async def offer_begin(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    await state.set_state(Offer.title)
+    await c.message.answer("Название курса:")
+    await c.answer()
+
+
+@router.message(Offer.title)
+async def offer_title(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    await state.update_data(title=m.text or "Курс")
+    await state.set_state(Offer.description)
+
+    await m.answer("Описание курса:")
+
+
+@router.message(Offer.description)
+async def offer_desc(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    await state.update_data(description=m.text or "")
+    await state.set_state(Offer.url)
+
+    await m.answer("Ссылка на курс:")
+
+
+@router.message(Offer.url)
+async def offer_url(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    url = (m.text or "").strip()
+
+    if not url.startswith(("https://", "http://")):
+        await m.answer("Пришли ссылку с https://")
+        return
+
+    d = await state.get_data()
+
+    await add_offer(
+        d["title"],
+        d["description"],
+        url
+    )
+
+    await state.clear()
+
+    await m.answer(
+        "Курс добавлен 💅",
+        reply_markup=admin_menu()
+    )
+
+
+# =========================
+# УПРАВЛЕНИЕ МАТЕРИАЛАМИ
+# =========================
+
+@router.callback_query(F.data == "manage_materials")
+async def materials(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    xs = await get_all_materials()
+
+    await safe_edit_text(
+        c.message,
+        "Управление материалами:",
+        reply_markup=list_kb(xs, "mat") if xs else admin_menu()
+    )
+
+    await c.answer()
+
+
+# =========================
+# УПРАВЛЕНИЕ КУРСАМИ
+# =========================
+
+@router.callback_query(F.data == "manage_offers")
+async def offers(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    xs = await get_all_offers()
+
+    await safe_edit_text(
+        c.message,
+        "Управление курсами:",
+        reply_markup=list_kb(xs, "offer") if xs else admin_menu()
+    )
+
+    await c.answer()
+
+
+# =========================
+# ПРОСМОТР ЗАПИСИ
+# =========================
+
+@router.callback_query(
+    F.data.startswith(("mat_item_", "offer_item_"))
+)
+async def item_show(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    prefix = "mat" if c.data.startswith("mat_") else "offer"
+    iid = int(c.data.rsplit("_", 1)[1])
+
+    xs = await (
+        get_all_materials()
+        if prefix == "mat"
+        else get_all_offers()
+    )
+
+    item = next(
+        (x for x in xs if x["id"] == iid),
+        None
+    )
+
+    if not item:
+        await c.answer("Не найдено", show_alert=True)
+        return
+
+    status = "включён" if item["active"] else "выключен"
+
+    await safe_edit_text(
+        c.message,
+        f"<b>{item['title']}</b>\nСтатус: {status}",
+        reply_markup=item_kb(prefix, item)
+    )
+
+    await c.answer()
+
+
+# =========================
+# ВКЛЮЧЕНИЕ И ВЫКЛЮЧЕНИЕ
+# =========================
+
+@router.callback_query(
+    F.data.startswith(("mat_toggle_", "offer_toggle_"))
+)
+async def item_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    prefix = "mat" if c.data.startswith("mat_") else "offer"
+    iid = int(c.data.rsplit("_", 1)[1])
+
+    if prefix == "mat":
+        await toggle_material(iid)
+        xs = await get_all_materials()
+    else:
+        await toggle_offer(iid)
+        xs = await get_all_offers()
+
+    await safe_edit_text(
+        c.message,
+        "Выбери запись:",
+        reply_markup=list_kb(xs, prefix)
+    )
+
+    await c.answer("Статус изменён")
+
+
+# =========================
+# УДАЛЕНИЕ
+# =========================
+
+@router.callback_query(
+    F.data.startswith(("mat_delete_", "offer_delete_"))
+)
+async def item_delete(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    prefix = "mat" if c.data.startswith("mat_") else "offer"
+    iid = int(c.data.rsplit("_", 1)[1])
+
+    if prefix == "mat":
+        await delete_material(iid)
+        xs = await get_all_materials()
+    else:
+        await delete_offer(iid)
+        xs = await get_all_offers()
+
+    await safe_edit_text(
+        c.message,
+        "Запись удалена. Выбери следующую:",
+        reply_markup=list_kb(xs, prefix) if xs else admin_menu()
+    )
+
+    await c.answer()
+
+
+# =========================
+# СТАТИСТИКА
+# =========================
+
+@router.callback_query(F.data == "stats")
+async def stats(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    u, m, o = await get_stats()
+
+    await safe_edit_text(
+        c.message,
+        f"📊 Статистика\n"
+        f"Пользователей: {u}\n"
+        f"Материалов: {m}\n"
+        f"Курсов: {o}",
+        reply_markup=admin_menu()
+    )
+
+    await c.answer()
+
+
+# =========================
+# РАССЫЛКА
+# =========================
+
+@router.callback_query(F.data == "broadcast")
+async def broadcast_begin(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    await state.set_state(Broadcast.content)
+
+    await c.message.answer(
+        "Пришли одним сообщением текст, фото, видео или документ для рассылки."
+    )
+
+    await c.answer()
+
+
+@router.message(Broadcast.content)
+async def broadcast_preview(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return
+
+    if not (m.text or m.photo or m.video or m.document):
+        await m.answer(
+            "Поддерживаются текст, фото, видео и документы."
+        )
+        return
+
+    await state.update_data(
+        chat_id=m.chat.id,
+        message_id=m.message_id
+    )
+
+    await m.answer(
+        "Проверь сообщение выше. Отправить всем?",
+        reply_markup=confirm_broadcast()
+    )
+
+
+@router.callback_query(F.data == "broadcast_send")
+async def broadcast_send(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await no_access(c)
+        return
+
+    d = await state.get_data()
+
+    if not d.get("message_id"):
+        await c.answer(
+            "Сначала подготовь сообщение",
+            show_alert=True
+        )
+        return
+
+    ids = await get_user_ids()
+    sent = 0
+    failed = 0
+
+    await safe_edit_text(
+        c.message,
+        "Рассылка выполняется…"
+    )
+
+    for uid in ids:
+        try:
+            await c.bot.copy_message(
+                uid,
+                d["chat_id"],
+                d["message_id"]
+            )
+            sent += 1
+
+        except TelegramForbiddenError:
+            failed += 1
+
+        except Exception:
+            failed += 1
+
+        await asyncio.sleep(0.06)
+
+    await state.clear()
+
+    await c.message.answer(
+        f"Рассылка завершена.\n"
+        f"Успешно: {sent}; не доставлено: {failed}.",
+        reply_markup=admin_menu()
+    )
+
+    await c.answer()
